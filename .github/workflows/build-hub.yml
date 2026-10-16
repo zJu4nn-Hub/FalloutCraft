@@ -1,0 +1,102 @@
+# Build used by the zJu4nn Hub "Mashups" tab.
+# - The Minecraft Fabric mod (fabric/) is compiled HERE from this fork's source at the upstream v0.1.3 commit.
+# - The Fallout 4 F4SE plugin is built upstream from a separate CommonLibF4 template checkout that isn't part of this
+#   repository, so it is the upstream v0.1.3 release dll, pinned by sha256 (zip and dll). Its sources are
+#   FO4_ModFiles/ in this repository.
+# F4SE and the Address Library are NOT here (Nexus Mods doesn't allow rehosting): the player downloads them from
+# Nexus inside the Hub. Upstream: https://github.com/zeyvu/FalloutCraft (MIT), based on SkyCraft by chasmlol (MIT).
+name: build-hub
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. hub-v0.1.3-1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      SRC: 70032ac7ec66749a45099e08611f9ec9c399235b
+      UP_URL: https://github.com/zeyvu/FalloutCraft/releases/download/v0.1.3/FalloutCraft-0.1.3-FO4.zip
+      UP_SHA256: 7a4a46368b7d7d07de2c7f0f96152e4fcf0529b609905399e3f0fca547c55230
+      PLUGIN_SHA256: 47ceec457386fea066f74d5b84272443099e87ff690f8edee96f9049e7d845c3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SRC }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fabric mod
+        shell: pwsh
+        run: |
+          $env:GRADLE_USER_HOME = Join-Path (Get-Location) '.tools\gradle-home'
+          .\fabric\gradlew.bat -p .\fabric --no-daemon --no-configuration-cache build -x test
+          if ($LASTEXITCODE) { throw "mod build failed" }
+
+      - name: Upstream plugin (pinned)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest $env:UP_URL -OutFile up.zip
+          $h = (Get-FileHash up.zip -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne $env:UP_SHA256) { throw "upstream zip sha256 mismatch: $h" }
+          # the upstream zip uses backslashes in its entry names: read the entry by name
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $z = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path up.zip).Path)
+          New-Item -ItemType Directory plugin -Force | Out-Null
+          foreach ($e in $z.Entries) {
+            if ($e.FullName.Replace('\','/') -eq 'Data/F4SE/Plugins/commonlibf4-template.dll') { [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, (Join-Path (Get-Location) 'plugin/FalloutCraft.dll'), $true) }
+          }
+          $z.Dispose()
+          $p = (Get-FileHash plugin/FalloutCraft.dll -Algorithm SHA256).Hash.ToLower()
+          if ($p -ne $env:PLUGIN_SHA256) { throw "plugin dll sha256 mismatch: $p" }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path fabric/gradle.properties -Pattern '^version=(.+)$').Matches[0].Groups[1].Value.Trim()
+          $jar = Get-ChildItem fabric/build/libs -Filter "*.jar" | Where-Object { $_.Name -notmatch 'sources' } | Select-Object -First 1
+          if (!$jar) { throw "mod jar not found" }
+          $p = 'pkg'
+          New-Item -ItemType Directory "$p/F4SE/Plugins/FalloutCraft","$p/mods" -Force | Out-Null
+          # same file name as upstream: F4SE loads every dll in Data\F4SE\Plugins
+          Copy-Item plugin/FalloutCraft.dll "$p/F4SE/Plugins/commonlibf4-template.dll"
+          Copy-Item LICENSE "$p/F4SE/Plugins/FalloutCraft/LICENSE.txt"
+          Copy-Item $jar.FullName "$p/mods/falloutcraft-$ver.jar"
+          @(
+            "FalloutCraft $ver (build do zJu4nn Hub)",
+            '',
+            'Fallout 4 jogado como um jogador de Minecraft. Original de zeyvu (github.com/zeyvu/FalloutCraft), baseado',
+            'no SkyCraft de chasmlol. Licenca MIT. F4SE e Address Library: baixados pela propria pessoa no Nexus Mods.',
+            'Projeto de fas, sem ligacao com Bethesda, ZeniMax, Mojang ou Microsoft.'
+          ) | Set-Content "$p/LEIA.txt" -Encoding utf8
+          $sums = Get-ChildItem $p -Recurse -File | ForEach-Object {
+            $rel = $_.FullName.Substring((Resolve-Path $p).Path.Length + 1).Replace('\','/')
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $rel"
+          }
+          $sums | Set-Content "$p/SHA256SUMS.txt" -Encoding ascii
+          $sums
+          $zip = "falloutcraft-hub-$ver.zip"
+          Compress-Archive -Path "$p/*" -DestinationPath $zip
+          "ZIP=$zip" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "VER=$ver" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Get-FileHash $zip -Algorithm SHA256 | Format-List
+
+      - name: Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag }}" $env:ZIP --repo "${{ github.repository }}" --target main --title "FalloutCraft $env:VER (zJu4nn Hub)" --notes "Build of zeyvu/FalloutCraft $env:VER for the zJu4nn Hub Mashups tab. Minecraft mod compiled from this fork at $env:SRC; the F4SE plugin is the upstream v0.1.3 dll (sha256 $env:PLUGIN_SHA256). MIT."
